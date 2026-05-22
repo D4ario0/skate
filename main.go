@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -88,6 +89,24 @@ var (
 		Aliases: []string{"del-db", "rm-db"},
 		Args:    cobra.MinimumNArgs(1),
 		RunE:    deleteDb,
+	}
+
+	shellCmd = &cobra.Command{
+		Use:           "shell [@DB]",
+		Short:         "Start an interactive shell with variables from @ db injected into the environment.",
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		Args:          cobra.MaximumNArgs(1),
+		RunE:          shell,
+	}
+
+	runCmd = &cobra.Command{
+		Use:           "run [@DB] -- COMMAND [ARGS...]",
+		Short:         "Run a command with variables from @ db injected into the environment.",
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		Args:          cobra.MinimumNArgs(1),
+		RunE:          run,
 	}
 )
 
@@ -408,6 +427,107 @@ func openKV(name string) (*badger.DB, error) {
 	return badger.Open(badger.DefaultOptions(path).WithLoggingLevel(badger.ERROR)) //nolint:wrapcheck
 }
 
+func envFromDB(dbName string) ([]string, error) {
+	db, err := openKV(dbName)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close() //nolint:errcheck
+
+	var env []string
+	err = db.View(func(txn *badger.Txn) error {
+		it := txn.NewIterator(badger.DefaultIteratorOptions)
+		defer it.Close()
+		for it.Rewind(); it.Valid(); it.Next() {
+			item := it.Item()
+			k := item.KeyCopy(nil)
+			err := item.Value(func(v []byte) error {
+				env = append(env, fmt.Sprintf("%s=%s", string(k), string(v)))
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return env, nil
+}
+
+func parseDBArg(arg string) (string, error) {
+	if arg == "" {
+		return "", nil
+	}
+	if !strings.HasPrefix(arg, "@") {
+		return "", fmt.Errorf("bad db format, use @DB")
+	}
+	_, dbName, err := keyParser(arg)
+	if err != nil {
+		return "", err
+	}
+	return dbName, nil
+}
+
+func executeWithEnv(bin string, args []string, vars []string) error {
+	c := exec.Command(bin, args...) //nolint:gosec
+	c.Stdin = os.Stdin
+	c.Stdout = os.Stdout
+	c.Stderr = os.Stderr
+	c.Env = append(os.Environ(), vars...)
+	if err := c.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			os.Exit(exitErr.ExitCode())
+		}
+		return err
+	}
+	return nil
+}
+
+func shell(_ *cobra.Command, args []string) error {
+	var dbName string
+	if len(args) == 1 {
+		var err error
+		dbName, err = parseDBArg(args[0])
+		if err != nil {
+			return err
+		}
+	}
+	vars, err := envFromDB(dbName)
+	if err != nil {
+		return err
+	}
+	sh := os.Getenv("SHELL")
+	if sh == "" {
+		return fmt.Errorf("$SHELL is not set")
+	}
+	return executeWithEnv(sh, nil, vars)
+}
+
+func run(_ *cobra.Command, args []string) error {
+	dbName := ""
+	cmdStart := 0
+	if strings.HasPrefix(args[0], "@") {
+		var err error
+		dbName, err = parseDBArg(args[0])
+		if err != nil {
+			return err
+		}
+		cmdStart = 1
+	}
+	if len(args[cmdStart:]) == 0 {
+		return fmt.Errorf("no command provided")
+	}
+	vars, err := envFromDB(dbName)
+	if err != nil {
+		return err
+	}
+	return executeWithEnv(args[cmdStart], args[cmdStart+1:], vars)
+}
+
 func init() {
 	listCmd.Flags().BoolVarP(&reverseIterate, "reverse", "r", false, "list in reverse lexicographic order")
 	listCmd.Flags().BoolVarP(&keysIterate, "keys-only", "k", false, "only print keys and don't fetch values from the db")
@@ -423,6 +543,8 @@ func init() {
 		listCmd,
 		listDbsCmd,
 		deleteDbCmd,
+		shellCmd,
+		runCmd,
 	)
 }
 
