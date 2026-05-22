@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -29,6 +30,7 @@ var (
 	valuesIterate    bool
 	showBinary       bool
 	delimiterIterate string
+	envFileSet       string
 
 	warningStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("204")).Bold(true)
 
@@ -44,8 +46,8 @@ var (
 	setCmd = &cobra.Command{
 		Use:     "set KEY[@DB] [VALUE]",
 		Short:   "Set a value for a key with an optional @ db. If VALUE is omitted, read value from the standard input.",
-		Example: "  skate set foo bar\n  skate set foo <./bar.txt",
-		Args:    cobra.RangeArgs(1, 2),
+		Example: "  skate set foo bar\n  skate set foo <./bar.txt\n  skate set --from-env .env\n  skate set --from-env .env @work",
+		Args:    validateSetArgs,
 		RunE:    set,
 	}
 
@@ -123,6 +125,9 @@ func (err errDBNotFound) Error() string {
 
 //nolint:wrapcheck
 func set(cmd *cobra.Command, args []string) error {
+	if envFileSet != "" {
+		return setFromEnv(args)
+	}
 	k, n, err := keyParser(args[0])
 	if err != nil {
 		return err
@@ -144,6 +149,140 @@ func set(cmd *cobra.Command, args []string) error {
 	return wrap(db, false, func(tx *badger.Txn) error {
 		return tx.Set(k, bts)
 	})
+}
+
+func validateSetArgs(cmd *cobra.Command, args []string) error {
+	if cmd.Flags().Changed("from-env") {
+		return cobra.MaximumNArgs(2)(cmd, args)
+	}
+	return cobra.RangeArgs(1, 2)(cmd, args)
+}
+
+func setFromEnv(args []string) error {
+	envPath := envFileSet
+	dbName := ""
+	if len(args) > 0 && !strings.HasPrefix(args[0], "@") {
+		envPath = args[0]
+		args = args[1:]
+	}
+	if len(args) == 1 {
+		var err error
+		dbName, err = parseDBArg(args[0])
+		if err != nil {
+			return err
+		}
+	}
+	if len(args) > 1 {
+		return fmt.Errorf("too many arguments")
+	}
+	vars, err := parseEnvFile(envPath)
+	if err != nil {
+		return err
+	}
+	db, err := openKV(dbName)
+	if err != nil {
+		return err
+	}
+	defer db.Close() //nolint:errcheck
+
+	return wrap(db, false, func(tx *badger.Txn) error {
+		for k, v := range vars {
+			key, _, err := keyParser(k)
+			if err != nil {
+				return fmt.Errorf("%s: %w", k, err)
+			}
+			if err := tx.Set(key, []byte(v)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func parseEnvFile(path string) (map[string]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close() //nolint:errcheck
+
+	vars := make(map[string]string)
+	scanner := bufio.NewScanner(file)
+	lineNo := 0
+	for scanner.Scan() {
+		lineNo++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			return nil, fmt.Errorf("%s:%d: expected KEY=VALUE", path, lineNo)
+		}
+		key = strings.TrimSpace(key)
+		if key == "" {
+			return nil, fmt.Errorf("%s:%d: empty key", path, lineNo)
+		}
+		value, err := parseEnvValue(strings.TrimSpace(value))
+		if err != nil {
+			return nil, fmt.Errorf("%s:%d: %w", path, lineNo, err)
+		}
+		vars[key] = value
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return vars, nil
+}
+
+func parseEnvValue(value string) (string, error) {
+	if value == "" {
+		return "", nil
+	}
+	quote := value[0]
+	if quote == '"' || quote == '\'' {
+		end := closingQuoteIndex(value, quote)
+		if end == -1 {
+			return "", fmt.Errorf("unterminated quoted value")
+		}
+		rest := strings.TrimSpace(value[end+1:])
+		if rest != "" && !strings.HasPrefix(rest, "#") {
+			return "", fmt.Errorf("unexpected content after quoted value")
+		}
+		value = value[1:end]
+		if quote == '"' {
+			unquoted, err := strconv.Unquote(`"` + value + `"`)
+			if err != nil {
+				return "", err
+			}
+			return unquoted, nil
+		}
+		return value, nil
+	}
+	return strings.TrimSpace(stripEnvComment(value)), nil
+}
+
+func closingQuoteIndex(value string, quote byte) int {
+	for i := 1; i < len(value); i++ {
+		if value[i] != quote {
+			continue
+		}
+		if quote == '"' && value[i-1] == '\\' {
+			continue
+		}
+		return i
+	}
+	return -1
+}
+
+func stripEnvComment(value string) string {
+	for i, r := range value {
+		if r == '#' && (i == 0 || value[i-1] == ' ' || value[i-1] == '\t') {
+			return value[:i]
+		}
+	}
+	return value
 }
 
 //nolint:wrapcheck
@@ -529,6 +668,8 @@ func run(_ *cobra.Command, args []string) error {
 }
 
 func init() {
+	setCmd.Flags().StringVar(&envFileSet, "from-env", "", "set values from a dotenv file")
+	setCmd.Flags().Lookup("from-env").NoOptDefVal = ".env"
 	listCmd.Flags().BoolVarP(&reverseIterate, "reverse", "r", false, "list in reverse lexicographic order")
 	listCmd.Flags().BoolVarP(&keysIterate, "keys-only", "k", false, "only print keys and don't fetch values from the db")
 	listCmd.Flags().BoolVarP(&valuesIterate, "values-only", "v", false, "only print values")

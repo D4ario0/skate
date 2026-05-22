@@ -38,6 +38,9 @@ skate get profile-pic > here-it-is.jpg
 skate set 猫咪 喵
 skate get 猫咪
 
+# Import a dotenv file
+skate set --from-env .env
+
 # For more info
 skate --help
 
@@ -128,6 +131,16 @@ skate list @work-stuff
 
 # Wait, what was that db named?
 skate list-dbs
+```
+
+### Dotenv Import
+
+```bash
+# Import KEY=VALUE entries from .env into the default database
+skate set --from-env
+
+# Import a specific dotenv file into a specific database
+skate set --from-env .env.local @work-stuff
 ```
 
 ## Examples
