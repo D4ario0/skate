@@ -491,6 +491,7 @@ func list(_ *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	defer db.Close() //nolint:errcheck
 	err = db.Sync()
 	if err != nil {
 		return err
