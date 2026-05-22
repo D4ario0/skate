@@ -3,6 +3,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -31,8 +32,10 @@ var (
 	showBinary       bool
 	delimiterIterate string
 	envFileSet       string
+	secretSet        bool
 
-	warningStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("204")).Bold(true)
+	warningStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("204")).Bold(true)
+	secretKeyPrefix = []byte("\x00secret:")
 
 	rootCmd = &cobra.Command{
 		Use:   "skate",
@@ -139,7 +142,10 @@ func set(cmd *cobra.Command, args []string) error {
 	defer db.Close() //nolint:errcheck
 	if len(args) == 2 {
 		return wrap(db, false, func(tx *badger.Txn) error {
-			return tx.Set(k, []byte(args[1]))
+			if err := tx.Set(k, []byte(args[1])); err != nil {
+				return err
+			}
+			return setSecretMarker(tx, k, secretSet)
 		})
 	}
 	bts, err := io.ReadAll(cmd.InOrStdin())
@@ -147,7 +153,10 @@ func set(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	return wrap(db, false, func(tx *badger.Txn) error {
-		return tx.Set(k, bts)
+		if err := tx.Set(k, bts); err != nil {
+			return err
+		}
+		return setSecretMarker(tx, k, secretSet)
 	})
 }
 
@@ -192,6 +201,9 @@ func setFromEnv(args []string) error {
 				return fmt.Errorf("%s: %w", k, err)
 			}
 			if err := tx.Set(key, []byte(v)); err != nil {
+				return err
+			}
+			if err := setSecretMarker(tx, key, true); err != nil {
 				return err
 			}
 		}
@@ -323,7 +335,10 @@ func del(_ *cobra.Command, args []string) error {
 	defer db.Close() //nolint:errcheck
 
 	return wrap(db, false, func(tx *badger.Txn) error {
-		return tx.Delete(k)
+		if err := tx.Delete(k); err != nil {
+			return err
+		}
+		return deleteSecretMarker(tx, k)
 	})
 }
 
@@ -492,15 +507,26 @@ func list(_ *cobra.Command, args []string) error {
 		for it.Rewind(); it.Valid(); it.Next() {
 			item := it.Item()
 			k := item.Key()
+			if isSecretMarkerKey(k) {
+				continue
+			}
 			if keysIterate {
 				printFromKV(pf, k)
 				continue
 			}
 			err := item.Value(func(v []byte) error {
 				if valuesIterate {
-					printFromKV(pf, v)
+					if isSecret(txn, k) {
+						printFromKV(pf, []byte("******"))
+					} else {
+						printFromKV(pf, v)
+					}
 				} else {
-					printFromKV(pf, k, v)
+					if isSecret(txn, k) {
+						printFromKV(pf, k, []byte("******"))
+					} else {
+						printFromKV(pf, k, v)
+					}
 				}
 				return nil
 			})
@@ -545,9 +571,9 @@ func keyParser(k string) ([]byte, string, error) {
 	ps := strings.Split(k, "@")
 	switch len(ps) {
 	case 1:
-		key = strings.ToLower(ps[0])
+		key = ps[0]
 	case 2:
-		key = strings.ToLower(ps[0])
+		key = ps[0]
 		db = strings.ToLower(ps[1])
 	default:
 		return nil, "", fmt.Errorf("bad key format, use KEY@DB")
@@ -566,6 +592,37 @@ func openKV(name string) (*badger.DB, error) {
 	return badger.Open(badger.DefaultOptions(path).WithLoggingLevel(badger.ERROR)) //nolint:wrapcheck
 }
 
+func secretMarkerKey(k []byte) []byte {
+	out := make([]byte, 0, len(secretKeyPrefix)+len(k))
+	out = append(out, secretKeyPrefix...)
+	out = append(out, k...)
+	return out
+}
+
+func isSecretMarkerKey(k []byte) bool {
+	return bytes.HasPrefix(k, secretKeyPrefix)
+}
+
+func setSecretMarker(tx *badger.Txn, k []byte, secret bool) error {
+	if secret {
+		return tx.Set(secretMarkerKey(k), []byte("1"))
+	}
+	return deleteSecretMarker(tx, k)
+}
+
+func deleteSecretMarker(tx *badger.Txn, k []byte) error {
+	err := tx.Delete(secretMarkerKey(k))
+	if errors.Is(err, badger.ErrKeyNotFound) {
+		return nil
+	}
+	return err
+}
+
+func isSecret(tx *badger.Txn, k []byte) bool {
+	_, err := tx.Get(secretMarkerKey(k))
+	return err == nil
+}
+
 func envFromDB(dbName string) ([]string, error) {
 	db, err := openKV(dbName)
 	if err != nil {
@@ -580,6 +637,9 @@ func envFromDB(dbName string) ([]string, error) {
 		for it.Rewind(); it.Valid(); it.Next() {
 			item := it.Item()
 			k := item.KeyCopy(nil)
+			if isSecretMarkerKey(k) {
+				continue
+			}
 			err := item.Value(func(v []byte) error {
 				env = append(env, fmt.Sprintf("%s=%s", string(k), string(v)))
 				return nil
@@ -670,6 +730,7 @@ func run(_ *cobra.Command, args []string) error {
 func init() {
 	setCmd.Flags().StringVar(&envFileSet, "from-env", "", "set values from a dotenv file")
 	setCmd.Flags().Lookup("from-env").NoOptDefVal = ".env"
+	setCmd.Flags().BoolVar(&secretSet, "secret", false, "mask this value in list output")
 	listCmd.Flags().BoolVarP(&reverseIterate, "reverse", "r", false, "list in reverse lexicographic order")
 	listCmd.Flags().BoolVarP(&keysIterate, "keys-only", "k", false, "only print keys and don't fetch values from the db")
 	listCmd.Flags().BoolVarP(&valuesIterate, "values-only", "v", false, "only print values")
